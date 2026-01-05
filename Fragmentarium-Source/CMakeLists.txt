@@ -26,7 +26,8 @@ message( STATUS "Fragmentarium-${FRAGM_VERSION}-${PACKAGE_BUILD}" )
 
 project(Fragmentarium-${FRAGM_VERSION} VERSION ${FRAGM_VERSION} LANGUAGES CXX)
 
-set (CMAKE_CXX_STANDARD 11)
+set (CMAKE_CXX_STANDARD 17)
+set (CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set( CMAKE_MODULE_PATH /usr/share/cmake/Modules )
 
@@ -43,10 +44,80 @@ ENDIF ()
 find_package(Qt5 COMPONENTS Widgets Core OpenGL Gui Xml Script ScriptTools REQUIRED)
 
 set ( CMAKE_BUILD_TYPE Release )
+
+# Performance optimization options
+option(ENABLE_PARALLEL_BUILD "Enable parallel compilation" ON)
+option(ENABLE_LTO "Enable Link Time Optimization" ON)
+option(ENABLE_PGO "Enable Profile Guided Optimization" OFF)
+
+# Parallel compilation
+if(ENABLE_PARALLEL_BUILD)
+    include(ProcessorCount)
+    ProcessorCount(N)
+    if(N GREATER 1)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -j${N}")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -j${N}")
+        message(STATUS "Enabled parallel compilation with ${N} jobs")
+    endif()
+endif()
+
+# Compiler-specific optimizations
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Release optimizations
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
+    
+    # Enable LTO for release builds
+    if(ENABLE_LTO)
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -flto")
+        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto")
+        message(STATUS "Enabled Link Time Optimization")
+    endif()
+    
+    # Profile-guided optimization
+    if(ENABLE_PGO)
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fprofile-generate")
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -fprofile-generate")
+        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -fprofile-generate")
+        message(STATUS "Enabled Profile Guided Optimization")
+    endif()
+    
+    # Additional performance flags
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -funroll-loops -ffast-math")
+endif()
+
+# MSVC optimizations
+if(MSVC)
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GL")  # Whole program optimization
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG")  # Link-time code generation
+    message(STATUS "MSVC release optimizations enabled")
+endif()
 set ( CMAKE_AUTOMOC ON )
 set ( CMAKE_AUTOUIC ON)
 set ( CMAKE_AUTORCC ON)
 set ( CMAKE_INCLUDE_CURRENT_DIR ON )
+
+# Qt performance optimizations
+set(CMAKE_AUTOMOC_OPTIONS "-f" PARENT_SCOPE)
+set(CMAKE_AUTOUIC_OPTIONS "" PARENT_SCOPE)
+set(CMAKE_AUTORCC_OPTIONS "" PARENT_SCOPE)
+
+# Precompiled headers support (C++17 feature)
+if(CMAKE_CXX_STANDARD GREATER_EQUAL 17)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Winvalid-pch")
+    message(STATUS "Precompiled headers support enabled for C++17")
+endif()
+
+# Enable ccache if available for faster rebuilds
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+    set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+    set(CMAKE_CUDA_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+    message(STATUS "ccache enabled for faster compilation")
+endif()
 
 IF ( NOT WIN32 )
 	find_package ( glm REQUIRED )
