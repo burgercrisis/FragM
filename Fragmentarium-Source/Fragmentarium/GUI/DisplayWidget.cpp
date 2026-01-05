@@ -8,6 +8,14 @@
 #include <QMenu>
 #include <QStatusBar>
 #include <QWheelEvent>
+#include <QTimer>
+#include <QSettings>
+#include <QMetaObject>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QtConcurrent>
+#include <QCryptographicHash>
+#include <QElapsedTimer>
 
 #include <glm/glm.hpp>
 #include <glm/ext.hpp>
@@ -176,6 +184,18 @@ DisplayWidget::DisplayWidget ( MainWindow* mainWin, QWidget* parent )
     tileImage = nullptr;
     svao=0;
     svbo=0;
+    
+    // Initialize adaptive rendering metrics
+    perfMetrics.frameTimeMs = 0;
+    perfMetrics.targetFPS = 30.0;
+    perfMetrics.currentQuality = QualityLevel::Medium;
+    perfMetrics.adaptiveSampleCount = 1;
+    perfMetrics.isAdaptiveMode = false;
+    
+    // Initialize shader compilation system
+    compilationInProgress = false;
+    shaderCompilationThread = nullptr;
+    totalTextureMemory = 0;
 }
 
 void DisplayWidget::initializeGL()
@@ -2982,6 +3002,341 @@ void DisplayWidget::testVersions()
         fragmentSource.bufferShaderSource->vertexSource[0] = bvtmp;
         initBufferShader();
     }
+}
+
+qint64 DisplayWidget::estimateTextureMemory(const QString& texturePath, GLenum type) {
+    QFileInfo fileInfo(texturePath);
+    if (!fileInfo.exists()) return 0;
+    
+    qint64 fileSize = fileInfo.size();
+    
+    // Estimate memory usage based on file type and size
+    if (texturePath.endsWith(".hdr", Qt::CaseInsensitive)) {
+        // HDR files are typically float data, estimate 4 channels * 4 bytes per pixel
+        // Assume square texture for cube maps, otherwise use aspect ratio estimation
+        if (type == GL_SAMPLER_CUBE) {
+            int side = static_cast<int>(sqrt(fileSize / (6 * 16))); // 6 faces, 16 bytes per pixel
+            return side * side * 6 * 16;
+        } else {
+            int pixels = fileSize / 16; // Rough estimation
+            return pixels * 16; // 4 channels * 4 bytes
+        }
+    } else if (texturePath.endsWith(".exr", Qt::CaseInsensitive)) {
+        // EXR files are float data, similar to HDR
+        return fileSize * 2; // Rough compression ratio
+    } else {
+        // Regular image files (PNG, JPG, etc.) - 4 channels * 1 byte per pixel
+        if (type == GL_SAMPLER_CUBE) {
+            int side = static_cast<int>(sqrt(fileSize / (6 * 4))); // 6 faces, 4 bytes per pixel
+            return side * side * 6 * 4;
+        } else {
+            return fileSize * 4; // Rough estimation for 4 channels
+        }
+    }
+}
+
+void DisplayWidget::cleanupTextureCache() {
+    // Remove oldest or least recently used textures when cache is too large
+    QMutableMapIterator<QPair<QString, QStringList>, int> i(TextureCache);
+    
+    // First pass: remove textures if we have too many
+    while (TextureCache.size() > MAX_TEXTURE_CACHE_SIZE / 2 && i.hasNext()) {
+        i.next();
+        GLuint textureID = i.value();
+        
+        // Check if texture is still in use
+        if (!TextureUnitCache.values().contains(textureID)) {
+            if (verbose) {
+                qDebug() << "Removing texture from cache due to size:" << i.key().first;
+            }
+            
+            // Subtract from memory tracking
+            if (TextureMemoryUsage.contains(textureID)) {
+                totalTextureMemory -= TextureMemoryUsage[textureID];
+                TextureMemoryUsage.remove(textureID);
+            }
+            
+            glDeleteTextures(1, &textureID); glCheckError();
+            i.remove();
+        }
+    }
+    
+    // Second pass: remove largest textures if memory usage is too high
+    if (totalTextureMemory > (MAX_TEXTURE_MEMORY_MB * 1024 * 1024)) {
+        QList<QPair<GLuint, qint64>> texturesBySize;
+        for (auto it = TextureMemoryUsage.begin(); it != TextureMemoryUsage.end(); ++it) {
+            if (!TextureUnitCache.values().contains(it.key())) {
+                texturesBySize.append(qMakePair(it.key(), it.value()));
+            }
+        }
+        
+        // Sort by size (largest first)
+        std::sort(texturesBySize.begin(), texturesBySize.end(), 
+                 [](const QPair<GLuint, qint64>& a, const QPair<GLuint, qint64>& b) {
+                     return a.second > b.second;
+                 });
+        
+        // Remove largest textures until memory is under limit
+        for (const auto& pair : texturesBySize) {
+            if (totalTextureMemory <= (MAX_TEXTURE_MEMORY_MB * 1024 * 1024)) break;
+            
+            // Find and remove this texture from cache
+            for (auto cacheIt = TextureCache.begin(); cacheIt != TextureCache.end(); ++cacheIt) {
+                if (cacheIt.value() == pair.first) {
+                    if (verbose) {
+                        qDebug() << "Removing large texture from cache:" << cacheIt.key().first 
+                                 << "Memory:" << pair.second / (1024*1024) << "MB";
+                    }
+                    
+                    totalTextureMemory -= pair.second;
+                    glDeleteTextures(1, &pair.first); glCheckError();
+                    TextureCache.erase(cacheIt);
+                    TextureMemoryUsage.remove(pair.first);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void DisplayWidget::optimizeTextureCache() {
+    // Periodically optimize the texture cache
+    if (TextureCache.size() > MAX_TEXTURE_CACHE_SIZE / 4) {
+        cleanupTextureCache();
+    }
+}
+
+// Adaptive Rendering System Implementation
+void DisplayWidget::updateAdaptiveRendering() {
+    if (!perfMetrics.isAdaptiveMode) return;
+    
+    qint64 frameTime = measureFrameTime();
+    perfMetrics.frameTimeMs = frameTime;
+    
+    double currentFPS = frameTime > 0 ? 1000.0 / frameTime : 0;
+    
+    // Adjust quality based on performance
+    if (currentFPS < perfMetrics.targetFPS * 0.8) {
+        // Performance is below target, reduce quality
+        if (perfMetrics.currentQuality == QualityLevel::Ultra) {
+            perfMetrics.currentQuality = QualityLevel::High;
+        } else if (perfMetrics.currentQuality == QualityLevel::High) {
+            perfMetrics.currentQuality = QualityLevel::Medium;
+        } else if (perfMetrics.currentQuality == QualityLevel::Medium) {
+            perfMetrics.currentQuality = QualityLevel::Low;
+        }
+        applyQualitySettings(perfMetrics.currentQuality);
+    } else if (currentFPS > perfMetrics.targetFPS * 1.2) {
+        // Performance is above target, increase quality
+        if (perfMetrics.currentQuality == QualityLevel::Low) {
+            perfMetrics.currentQuality = QualityLevel::Medium;
+        } else if (perfMetrics.currentQuality == QualityLevel::Medium) {
+            perfMetrics.currentQuality = QualityLevel::High;
+        } else if (perfMetrics.currentQuality == QualityLevel::High) {
+            perfMetrics.currentQuality = QualityLevel::Ultra;
+        }
+        applyQualitySettings(perfMetrics.currentQuality);
+    }
+}
+
+void DisplayWidget::setAdaptiveMode(bool enable) {
+    perfMetrics.isAdaptiveMode = enable;
+    if (enable) {
+        perfMetrics.currentQuality = QualityLevel::Medium;
+        perfMetrics.targetFPS = 30.0; // Default target
+        perfMetrics.adaptiveSampleCount = 1;
+        INFO("Adaptive rendering enabled");
+    } else {
+        INFO("Adaptive rendering disabled");
+    }
+}
+
+DisplayWidget::QualityLevel DisplayWidget::getOptimalQuality(double targetFPS) {
+    // Simple heuristic based on target FPS
+    if (targetFPS >= 60.0) return QualityLevel::High;
+    if (targetFPS >= 30.0) return QualityLevel::Medium;
+    return QualityLevel::Low;
+}
+
+void DisplayWidget::applyQualitySettings(QualityLevel quality) {
+    QSettings settings;
+    
+    switch (quality) {
+        case QualityLevel::Low:
+            // Reduce buffer resolution, disable expensive features
+            if (bufferSizeX > 0 && bufferSizeY > 0) {
+                bufferSizeX = qMax(512, bufferSizeX / 2);
+                bufferSizeY = qMax(512, bufferSizeY / 2);
+            }
+            settings.setValue("adaptiveQuality", "Low");
+            break;
+            
+        case QualityLevel::Medium:
+            // Balanced settings
+            settings.setValue("adaptiveQuality", "Medium");
+            break;
+            
+        case QualityLevel::High:
+            // Increase quality settings
+            settings.setValue("adaptiveQuality", "High");
+            break;
+            
+        case QualityLevel::Ultra:
+            // Maximum quality, may reduce FPS
+            settings.setValue("adaptiveQuality", "Ultra");
+            break;
+    }
+    
+    if (verbose) {
+        qDebug() << "Applied quality level:" << settings.value("adaptiveQuality").toString();
+    }
+}
+
+qint64 DisplayWidget::measureFrameTime() {
+    static QTime lastFrameTime = QTime::currentTime();
+    QTime currentTime = QTime::currentTime();
+    qint64 frameTime = lastFrameTime.msecsTo(currentTime);
+    lastFrameTime = currentTime;
+    return frameTime;
+}
+
+// Asynchronous Shader Compilation System
+void DisplayWidget::queueShaderCompilation(const QString& vertexSource, const QString& fragmentSource,
+                                          const QString& shaderName, bool isBufferShader,
+                                          std::function<void(bool, QString)> callback) {
+    QMutexLocker locker(&compilationMutex);
+    
+    ShaderCompilationJob job;
+    job.vertexSource = vertexSource;
+    job.fragmentSource = fragmentSource;
+    job.shaderName = shaderName;
+    job.isBufferShader = isBufferShader;
+    job.callback = callback;
+    
+    compilationQueue.append(job);
+    
+    // Start processing if not already running
+    if (!compilationInProgress) {
+        QMetaObject::invokeMethod(this, "processShaderCompilationQueue", Qt::QueuedConnection);
+    }
+}
+
+void DisplayWidget::processShaderCompilationQueue() {
+    if (compilationInProgress || compilationQueue.isEmpty()) {
+        return;
+    }
+    
+    compilationInProgress = true;
+    
+    // Process compilation in worker thread
+    QtConcurrent::run([this]() {
+        workerShaderCompilation();
+    });
+}
+
+void DisplayWidget::workerShaderCompilation() {
+    while (true) {
+        ShaderCompilationJob job;
+        
+        {
+            QMutexLocker locker(&compilationMutex);
+            if (compilationQueue.isEmpty()) {
+                break;
+            }
+            job = compilationQueue.takeFirst();
+        }
+        
+        // Perform actual shader compilation
+        bool success = false;
+        QString errorLog;
+        
+        makeCurrent();
+        
+        QOpenGLShaderProgram* program = new QOpenGLShaderProgram(this);
+        
+        // Compile vertex shader
+        bool vertexSuccess = program->addShaderFromSourceCode(QOpenGLShader::Vertex, job.vertexSource);
+        if (!vertexSuccess) {
+            errorLog = "Vertex shader compilation failed: " + program->log();
+        }
+        
+        // Compile fragment shader
+        if (vertexSuccess) {
+            bool fragmentSuccess = program->addShaderFromSourceCode(QOpenGLShader::Fragment, job.fragmentSource);
+            if (!fragmentSuccess) {
+                errorLog = "Fragment shader compilation failed: " + program->log();
+            }
+        }
+        
+        // Link program
+        if (vertexSuccess && !errorLog.contains("Fragment")) {
+            success = program->link();
+            if (!success) {
+                errorLog = "Shader linking failed: " + program->log();
+            }
+        }
+        
+        // Cache successful compilations
+        if (success) {
+            QString cacheKey = getShaderCacheKey(job.vertexSource, job.fragmentSource);
+            shaderCache[cacheKey] = program;
+            cleanupShaderCache(); // Maintain cache size limit
+        } else {
+            delete program;
+        }
+        
+        // Call callback on main thread
+        QMetaObject::invokeMethod([job, success, errorLog]() {
+            if (job.callback) {
+                job.callback(success, errorLog);
+            }
+        }, Qt::QueuedConnection);
+    }
+    
+    compilationInProgress = false;
+    
+    // Check if more jobs were queued while we were processing
+    QMetaObject::invokeMethod(this, "processShaderCompilationQueue", Qt::QueuedConnection);
+}
+
+void DisplayWidget::initializeShaderCompilationThread() {
+    compilationInProgress = false;
+    // Shader compilation is now handled by QtConcurrent
+}
+
+void DisplayWidget::cleanupShaderCompilation() {
+    QMutexLocker locker(&compilationMutex);
+    compilationQueue.clear();
+    
+    // Clean up shader cache
+    for (auto program : shaderCache.values()) {
+        delete program;
+    }
+    shaderCache.clear();
+}
+
+void DisplayWidget::cleanupShaderCache() {
+    if (shaderCache.size() <= MAX_SHADER_CACHE_SIZE) {
+        return;
+    }
+    
+    // Remove oldest entries (simple FIFO for now)
+    auto it = shaderCache.begin();
+    int toRemove = shaderCache.size() - MAX_SHADER_CACHE_SIZE;
+    
+    while (toRemove > 0 && it != shaderCache.end()) {
+        delete it.value();
+        it = shaderCache.erase(it);
+        toRemove--;
+    }
+}
+
+QString DisplayWidget::getShaderCacheKey(const QString& vertexSource, const QString& fragmentSource) {
+    // Simple hash-based cache key
+    return QString::fromLocal8Bit(QCryptographicHash::hash(
+        (vertexSource + fragmentSource).toLocal8Bit(), 
+        QCryptographicHash::Md5
+    ).toHex());
 }
 
 } // namespace GUI

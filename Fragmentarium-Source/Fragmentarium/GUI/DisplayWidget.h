@@ -224,6 +224,11 @@ public:
 
     QStringList getTextureChannels(QString textureUniformName);
     void clearTextureCache ( QMap<QPair<QString, QStringList>, bool>* textureCacheUsed );
+    
+    // Texture memory management
+    qint64 estimateTextureMemory(const QString& texturePath, GLenum type);
+    void cleanupTextureCache();
+    void optimizeTextureCache();
 
     QStringList getCurveSettings();
     void setCurveSettings ( const QStringList cset );
@@ -417,8 +422,14 @@ private:
     GLenum bufferType;
 
     QDateTime tileRenderStart;
+    
+    // Optimized texture cache with size management
+    static const int MAX_TEXTURE_CACHE_SIZE = 128; // Maximum number of cached textures
+    static const int MAX_TEXTURE_MEMORY_MB = 512; // Maximum texture memory in MB
     QMap<QPair<QString, QStringList>, int> TextureCache; // (filepath, channels) -> texture object
     QMap<QString, int> TextureUnitCache; // uniform name -> texture unit index
+    QMap<int, qint64> TextureMemoryUsage; // texture ID -> memory usage in bytes
+    qint64 totalTextureMemory = 0;
 
     bool doClearBackBuffer;
     QTimer* timer;
@@ -452,6 +463,52 @@ private:
     glm::mat4 m_pvmMatrix;
 
     int m_maxUniforms;
+    
+    // Adaptive rendering system
+    enum QualityLevel { Low, Medium, High, Ultra };
+    struct PerformanceMetrics {
+        qint64 frameTimeMs;
+        double targetFPS;
+        QualityLevel currentQuality;
+        int adaptiveSampleCount;
+        bool isAdaptiveMode;
+    };
+    PerformanceMetrics perfMetrics;
+    
+    // Adaptive rendering controls
+    void updateAdaptiveRendering();
+    void setAdaptiveMode(bool enable);
+    QualityLevel getOptimalQuality(double targetFPS);
+    void applyQualitySettings(QualityLevel quality);
+    qint64 measureFrameTime();
+    
+    // Asynchronous shader compilation system
+    struct ShaderCompilationJob {
+        QString vertexSource;
+        QString fragmentSource;
+        QString shaderName;
+        bool isBufferShader;
+        std::function<void(bool, QString)> callback;
+    };
+    
+    QList<ShaderCompilationJob> compilationQueue;
+    QThread* shaderCompilationThread;
+    bool compilationInProgress;
+    QMutex compilationMutex;
+    
+    void queueShaderCompilation(const QString& vertexSource, const QString& fragmentSource, 
+                               const QString& shaderName, bool isBufferShader,
+                               std::function<void(bool, QString)> callback);
+    void processShaderCompilationQueue();
+    void workerShaderCompilation();
+    void initializeShaderCompilationThread();
+    void cleanupShaderCompilation();
+    
+    // Shader caching
+    QMap<QString, QOpenGLShaderProgram*> shaderCache;
+    static const int MAX_SHADER_CACHE_SIZE = 16;
+    void cleanupShaderCache();
+    QString getShaderCacheKey(const QString& vertexSource, const QString& fragmentSource);
 
 /// Spline Shaders /////////////////////////////////////////////////////////
 QString vertexShader4 = QString("#version 410 core\n"
