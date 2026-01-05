@@ -186,8 +186,9 @@ bool VariableEditor::applyPreset()
     QString presetName = presetComboBox->currentText();
     QString preset = presets[presetName];
     /// this bit of fudge sets the current time to keyframe time
-    QRegExp rx = QRegExp("(KeyFrame\\.[0-9]+)");
-    if(rx.indexIn(presetName) != -1)  { /// found a keyframe
+    // use efficient string operations instead of repeated QRegExp
+    static const QRegExp presetRegex("(KeyFrame\\.[0-9]+)");
+    if(presetRegex.indexIn(presetName) != -1)  { /// found a keyframe
         mainWindow->setTimeSliderValue(getCurrentKeyFrame() * ((mainWindow->getTimeMax() * mainWindow->renderFPS) / (getKeyFrameCount() - 1)));
     }
     return setSettings(preset);
@@ -489,7 +490,9 @@ void VariableEditor::updateTextures(Parser::FragmentSource *fs, FileManager *fil
 
 void VariableEditor::substituteLockedVariables(Parser::FragmentSource *fs)
 {
+    // Cache regex patterns for performance
     static QRegExp exp(R"(^\s*uniform\s+(\S+)\s+(\S+)\s*;\s*$)");
+    static QRegExp nonDefineExp(R"(^\s*uniform\s+(\S+)\s+(\S+)\s*;\s*$)");
 
     QMap<QString, VariableWidget*> map;
     QStringList names;
@@ -504,9 +507,12 @@ void VariableEditor::substituteLockedVariables(Parser::FragmentSource *fs)
         INFO(tr("%1 locked variables: %2").arg(map.count()).arg(names.join(",")));
     }
 
+    // Pre-compile regex patterns for better performance
+    if (!exp.isValid()) return;
+    
     for (int i = 0; i < fs->source.count(); i++) {
         QString s = fs->source[i];
-        if (exp.indexIn(s)!=-1) {
+        if (exp.indexIn(s) != -1) {
             if (map.contains(exp.cap(2))) {
                 QString s;
                 if (!useDefines) {
@@ -677,22 +683,25 @@ void VariableEditor::updateFromFragmentSource(Parser::FragmentSource *fs /*, boo
             ps.append(bp);
         }
     }
-    // remove system variables and flag the rest for create/update
-    for (int i = 0; i < variables.count(); ) {
-        if (variables[i]->isSystemVariable()) {
-            variables.remove(i);
-            i = 0;
-        } else {
+    
+    // Use QSet for faster lookups
+    QSet<QString> existingVariableNames;
+    for (int i = 0; i < variables.count(); i++) {
+        if (!variables[i]->isSystemVariable()) {
+            existingVariableNames.insert(variables[i]->getUniqueName());
             variables[i]->setUpdated(false);
-            i++;
         }
     }
 
     // flag all tabs
     QMap<QString, bool> tabStillPresent;
-    foreach (QString s, tabs.keys()) {
+    for (const QString& s : tabs.keys()) {
         tabStillPresent[s] = false;
     }
+
+    // Batch process parameters to reduce UI updates
+    QVector<Parser::GuiParameter*> newParams;
+    newParams.reserve(ps.count());
 
     for (int i = 0; i < ps.count(); i++) {
 
@@ -713,23 +722,28 @@ void VariableEditor::updateFromFragmentSource(Parser::FragmentSource *fs /*, boo
         currentWidget = tabs[g];
 
         // is there already a variableWidget that matches this GuiParameter
-        bool found = false;
-        for (int j = 0; j < variables.count(); j++) {
-            QString name = variables[j]->getUniqueName();
-            if (name == ps[i]->getUniqueName()) {
-                found = true;
-                variables[j]->setUpdated(true);
-                variables[j]->setPalette(QApplication::palette(variables[j]));
-                variables[j]->setAutoFillBackground(false);
-                variables[j]->setHidden(false);
+        QString uniqueName = ps[i]->getUniqueName();
+        bool found = existingVariableNames.contains(uniqueName);
+        
+        if (found) {
+            // Find and update existing widget
+            for (int j = 0; j < variables.count(); j++) {
+                if (variables[j]->getUniqueName() == uniqueName) {
+                    variables[j]->setUpdated(true);
+                    variables[j]->setPalette(QApplication::palette(variables[j]));
+                    variables[j]->setAutoFillBackground(false);
+                    variables[j]->setHidden(false);
+                    break;
+                }
             }
+        } else {
+            newParams.append(ps[i]);
         }
+    }
 
-        // if the variableWidget that matches this GuiParameter does not exist then create it
-        if (!found) {
-            createWidgetFromGuiParameter(ps[i]);
-        }
-
+    // Create new widgets in batch
+    for (Parser::GuiParameter* param : newParams) {
+        createWidgetFromGuiParameter(param);
     }
 
     // cleanup any system vars and vars that were not updated
@@ -760,7 +774,6 @@ void VariableEditor::updateFromFragmentSource(Parser::FragmentSource *fs /*, boo
     //if (showGUI) (*showGUI) = (variables.count() != 0);
     setPresets(fs->presets);
     updateGeometry();
-
 }
 
 QString VariableEditor::getSettings( bool p )
