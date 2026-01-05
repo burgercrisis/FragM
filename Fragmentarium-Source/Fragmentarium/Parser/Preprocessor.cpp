@@ -32,6 +32,16 @@ FragmentSource::FragmentSource() :
     depthToAlpha(false),
     autoFocus(false)
 {
+    // Initialize all containers
+    params.clear();
+    textures.clear();
+    presets.clear();
+    textureParams.clear();
+    source.clear();
+    vertexSource.clear();
+    sourceFileNames.clear();
+    lines.clear();
+    sourceFile.clear();
 }
 
 // Helpers:
@@ -296,12 +306,19 @@ void Preprocessor::parseSource(FragmentSource *fs, QString input, QString origin
     }
 }
 
-// We leak here, but fs's are copied!
-FragmentSource::~FragmentSource() = default;
-// {
-/*foreach (QFile* f, sourceFiles) delete(f);*/
-//delete(screenShaderSource);
-// }
+FragmentSource::~FragmentSource() {
+    // Clean up buffer shader source
+    if (bufferShaderSource != nullptr) {
+        delete bufferShaderSource;
+        bufferShaderSource = nullptr;
+    }
+    
+    // Clean up all parameter objects
+    for (GuiParameter* param : params) {
+        delete param;
+    }
+    params.clear();
+}
 
 FragmentSource Preprocessor::createAutosaveFragment(QString input, QString file)
 {
